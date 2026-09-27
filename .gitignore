@@ -50,3 +50,9 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# local
+
+.conda_env/
+voices-ext/
+
