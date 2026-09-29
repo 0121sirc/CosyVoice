@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 
 # PATH / LD_LIBRARY_PATH (onnxruntime CUDA EP) / malloc tuning (方案A + 方案B)
-source "$HERE/.conda_env/env.sh"
+source "$HERE/env.sh"
 
 # Speed tuning defaults (override by exporting the vars before calling this
 # script; see .conda_env/speed_notes.md for the measurements behind each knob).
@@ -133,7 +133,30 @@ cmd_start() {
     echo "Stale process $(cat "$PID_FILE") without a healthy endpoint; restarting."
     cmd_stop
   fi
+
+  # .conda_env/ is gitignored (it *is* the conda env), so a fresh clone ships no
+  # interpreter at this path. Fail with the recipe instead of letting nohup die
+  # quietly in the log.
+  if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: Python interpreter not found at: $PYTHON" >&2
+    echo "  The conda env (.conda_env/) is not part of this checkout. Create it, then retry:" >&2
+    echo "      conda create -p .conda_env python=3.10 pip" >&2
+    echo "      .conda_env/bin/pip install -r requirements.txt" >&2
+    echo "  re-run: ./openai_api_server.sh start" >&2
+    return 1
+  fi
+
   check_gpu_exclusive
+
+  # Refuse to start when the port is already taken: health_ok() would then answer
+  # for a process we did not start, and the readiness loop below could report
+  # "Up (pid $!)" for a pid that never bound the socket.
+  if port_listening "$PORT"; then
+    echo "ERROR: port $PORT is already in use; refusing to start a second server." >&2
+    ss -tlnp "sport = :$PORT" 2>/dev/null | sed 's/^/    /' >&2 || true
+    echo "  stop the owner first: ./openai_api_server.sh stop" >&2
+    return 1
+  fi
 
   mkdir -p "$RUN_DIR"
   : > "$LOG_FILE"
@@ -145,16 +168,18 @@ cmd_start() {
   echo "$pid" > "$PID_FILE"
 
   # Model loading takes ~1-2 minutes (llm.pt/flow.pt/hift.pt + wetext frontend).
+  # Liveness is checked BEFORE health: a pid that never bound the socket must
+  # lose, even if some other process happens to answer on this port.
   for _ in $(seq 1 300); do
-    if health_ok; then
-      echo "Up (pid $pid). Log: $LOG_FILE"
-      return 0
-    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "ERROR: server exited during startup. Last log lines:" >&2
       tail -20 "$LOG_FILE" >&2 || true
       rm -f "$PID_FILE"
       return 1
+    fi
+    if health_ok; then
+      echo "Up (pid $pid). Log: $LOG_FILE"
+      return 0
     fi
     sleep 1
   done

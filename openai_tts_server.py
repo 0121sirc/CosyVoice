@@ -81,11 +81,13 @@ from cosyvoice.utils.common import set_all_random_seed  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("cosyvoice.openai")
 
-# Optional runtime instrumentation / speed knobs (see .conda_env/fast_patch.py).
+# Optional runtime instrumentation / speed knobs (see ./fast_patch.py, committed
+# at the repo root next to this file -- it used to live in the gitignored
+# .conda_env/, which made this import dangle in a fresh clone).
 # Everything is monkeypatched onto the loaded model, so no tracked source moves.
 _FAST_PATCH = None
 if os.environ.get("COSY_PROFILE") or os.environ.get("COSY_FAST"):
-    sys.path.insert(0, str(HERE / ".conda_env"))
+    sys.path.insert(0, str(HERE))
     try:
         import fast_patch as _FAST_PATCH
     except Exception as exc:                      # pragma: no cover

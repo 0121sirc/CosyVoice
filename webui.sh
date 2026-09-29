@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 HERE="$(pwd)"
 
 # PATH (ffprobe for gradio) / LD_LIBRARY_PATH (onnxruntime CUDA EP) / malloc tuning
-source "$HERE/.conda_env/env.sh"
+source "$HERE/env.sh"
 
 # Default probe host: the tailscale IP, else fall back to 127.0.0.1 with a warning.
 default_host() {
@@ -119,7 +119,29 @@ cmd_start() {
     echo "Stale process $(cat "$PID_FILE") without a healthy endpoint; restarting."
     cmd_stop
   fi
+
+  # .conda_env/ is gitignored (it *is* the conda env), so a fresh clone ships no
+  # interpreter at this path. Fail with the recipe instead of letting nohup die
+  # quietly in the log.
+  if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: Python interpreter not found at: $PYTHON" >&2
+    echo "  The conda env (.conda_env/) is not part of this checkout. Create it, then retry:" >&2
+    echo "      conda create -p .conda_env python=3.10 pip" >&2
+    echo "      .conda_env/bin/pip install -r requirements.txt" >&2
+    echo "  re-run: ./webui.sh start" >&2
+    return 1
+  fi
+
   check_gpu_exclusive
+
+  # Refuse to start when the port is already taken, otherwise health_ok() would
+  # answer for a process we did not start.
+  if port_listening "$PORT"; then
+    echo "ERROR: port $PORT is already in use; refusing to start a second WebUI." >&2
+    ss -tlnp "sport = :$PORT" 2>/dev/null | sed 's/^/    /' >&2 || true
+    echo "  stop the owner first: ./webui.sh stop" >&2
+    return 1
+  fi
 
   mkdir -p "$RUN_DIR"
   : > "$LOG_FILE"
@@ -129,16 +151,18 @@ cmd_start() {
   local pid=$!
   echo "$pid" > "$PID_FILE"
 
+  # Liveness before health: a pid that never bound the socket must lose even if
+  # another process answers on this port.
   for _ in $(seq 1 300); do
-    if health_ok; then
-      echo "Up (pid $pid). Log: $LOG_FILE"
-      return 0
-    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       echo "ERROR: WebUI exited during startup. Last log lines:" >&2
       tail -20 "$LOG_FILE" >&2 || true
       rm -f "$PID_FILE"
       return 1
+    fi
+    if health_ok; then
+      echo "Up (pid $pid). Log: $LOG_FILE"
+      return 0
     fi
     sleep 1
   done
