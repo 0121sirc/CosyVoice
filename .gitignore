@@ -56,3 +56,8 @@ pretrained_models/*
 .conda_env/
 voices-ext/
 
+# voices/ reference audio is runtime-required: _scan_voices() skips a voice
+# directory that has no prompt.*, so a clone without voices/default/prompt.wav
+# boots with zero voices. Only voices/ is exempted; *.wav still covers the rest.
+!voices/*/prompt.wav
+
