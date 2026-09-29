@@ -9,21 +9,28 @@ Mirrors ChatTTS_colab/openai_tts_server.py.
 Endpoints:
   GET  /v1/health        -> readiness probe
   GET  /v1/models        -> {"data": [{"id": ...}]}
-  GET  /v1/audio/voices  -> {"voices": ["default", ...], "default": ..., "details": {...}}
+  GET  /v1/audio/voices  -> {"voices": ["default", ...], "default": ...,
+                             "details": {name: {"desc": ...}}}   # display only;
+                             # the prompt text is server-side input, not exposed
+  GET  /v1/voices        -> identical body (alias; see the route below)
   POST /v1/audio/speech  -> pcm (streamed) | wav | mp3 | flac | opus
 
 Request body (OpenAI shape + ``seed`` / ``params`` extensions)::
 
     {
-      "model": "Fun-CosyVoice3-0.5B",
+      "model": "Fun-CosyVoice3-0.5B",   # optional, ignored; /v1/health reports the loaded dir
       "input": "要合成的文本",
       "voice": "default" | "bfy" | ...,
       "response_format": "pcm" | "wav" | "mp3" | "flac" | "opus",
       "speed": 1.0,
-      "seed": 0,
+      "seed": 42,
       "instructions": "带点笑意",           # OpenAI-style; params.instruction is the alias
       "params": {"instruction": "带点笑意", "text_frontend": true}
     }
+
+Seeding: ``seed`` defaults to 42, so a request that omits it is reproducible
+(fixed seed also keeps request latency variance down). Send any int to
+override; send ``"seed": null`` to opt out and get fresh randomness per call.
 
 A voice is one directory under any voice root. Roots are scanned in order and
 merged as a union (``voices/`` wins over ``voices-ext/`` on a name collision)::
@@ -51,11 +58,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from io import BytesIO
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Iterable, Iterator
 
 import numpy as np
@@ -72,6 +80,16 @@ from cosyvoice.utils.common import set_all_random_seed  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("cosyvoice.openai")
+
+# Optional runtime instrumentation / speed knobs (see .conda_env/fast_patch.py).
+# Everything is monkeypatched onto the loaded model, so no tracked source moves.
+_FAST_PATCH = None
+if os.environ.get("COSY_PROFILE") or os.environ.get("COSY_FAST"):
+    sys.path.insert(0, str(HERE / ".conda_env"))
+    try:
+        import fast_patch as _FAST_PATCH
+    except Exception as exc:                      # pragma: no cover
+        logger.warning("fast_patch unavailable: %r", exc)
 
 DEFAULT_MODEL_NAME = "Fun-CosyVoice3-0.5B"
 DEFAULT_VOICE = "default"
@@ -120,7 +138,27 @@ def _ensure_loaded():
                 _model = AutoModel(model_dir=str(_model_dir))
                 _sample_rate = int(_model.sample_rate)
                 logger.info("CosyVoice model loaded, sample_rate=%d", _sample_rate)
+                if _FAST_PATCH is not None:
+                    _FAST_PATCH.install(_model, logger)
     return _model
+
+
+# COSY_PREWARM=1: load the model and run the ONNX speech tokenizer once, in the
+# background, right after boot.  Its CUDA EP init costs ~27s and would otherwise
+# land inside the first client request (measured: first request 41.6s -> ~9s).
+@app.on_event("startup")
+def _prewarm_on_boot() -> None:
+    if not os.environ.get("COSY_PREWARM") or _FAST_PATCH is None:
+        return
+
+    def _job() -> None:
+        try:
+            cosy = _ensure_loaded()
+            _FAST_PATCH.prewarm(cosy, logger, HERE / "voices" / "default" / "prompt.wav")
+        except Exception as exc:                      # pragma: no cover
+            logger.warning("prewarm failed: %r", exc)
+
+    Thread(target=_job, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- voices
@@ -156,7 +194,6 @@ def _scan_voices() -> dict[str, dict]:
                     logger.warning("voice %s: ignoring broken meta.json (%s)", voice_dir, exc)
             prompt_text = str(meta.get("prompt_text") or "").strip()
             instruction = str(meta.get("instruction") or "").strip()
-            raw_prompt_text = prompt_text
             if prompt_text and ENDOFPROMPT not in prompt_text:
                 # Official demo shape is "You are a helpful assistant.<|endofprompt|>希望...";
                 # an empty meta.instruction yields "<|endofprompt|>希望...".
@@ -166,7 +203,6 @@ def _scan_voices() -> dict[str, dict]:
             voices[voice_dir.name] = {
                 "path": prompts[0],
                 "prompt_text": prompt_text,
-                "meta_prompt_text": raw_prompt_text,
                 "desc": str(meta.get("desc") or "").strip(),
             }
     if voices:
@@ -223,6 +259,12 @@ def _iter_audio(text: str, voice: dict, req: "SpeechRequest", stream: bool) -> I
     instruction = (req.instructions or extra.get("instruction") or "").strip()
     text_frontend = bool(extra.get("text_frontend", True))
 
+    if _FAST_PATCH is not None:
+        _FAST_PATCH.begin(
+            "instruct2" if instruction else
+            ("zero_shot" if voice["prompt_text"] else "cross_lingual"),
+            stream, getattr(getattr(cosy, "model", None), "token_hop_len", None))
+
     speed = 1.0 if req.speed is None else float(req.speed)
     if not (SPEED_MIN <= speed <= SPEED_MAX):
         clamped = min(max(speed, SPEED_MIN), SPEED_MAX)
@@ -260,7 +302,12 @@ def _iter_audio(text: str, voice: dict, req: "SpeechRequest", stream: bool) -> I
                                                stream=stream, speed=speed, text_frontend=text_frontend)
 
     try:
+        first_yield = True
         for model_output in outputs:
+            if first_yield:
+                first_yield = False
+                if _FAST_PATCH is not None:
+                    _FAST_PATCH.event("first_yield")
             yield model_output["tts_speech"].numpy().reshape(-1)
     except RuntimeError as exc:
         # Symptom of llm_job dying inside its thread (its exception never reaches
@@ -273,6 +320,11 @@ def _iter_audio(text: str, voice: dict, req: "SpeechRequest", stream: bool) -> I
                        "prompt_text (or the input text) must contain "
                        f"{ENDOFPROMPT} -- see the server log for the original error")
         raise
+    finally:
+        if _FAST_PATCH is not None:
+            for line in _FAST_PATCH.report(
+                    hop_end=getattr(getattr(cosy, "model", None), "token_hop_len", None)):
+                logger.info(line)
 
 
 def _pcm_stream(text: str, voice: dict, req: "SpeechRequest") -> Iterator[bytes]:
@@ -335,7 +387,7 @@ class SpeechRequest(BaseModel):
     voice: str | None = None
     response_format: str = "pcm"
     speed: float | None = None
-    seed: int | None = None
+    seed: int | None = 42
     instructions: str | None = None
     params: dict | None = None
 
@@ -345,7 +397,9 @@ def health() -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "model_loaded": _model is not None,
-        "model": DEFAULT_MODEL_NAME,
+        # The directory name, not a constant: pretrained_models/Fun-CosyVoice3-0.5B-RL
+        # reports itself as such, so /v1/health tells you which LLM checkpoint is live.
+        "model": _model_dir.name,
         "sample_rate": _sample_rate,
         "voices": sorted(_voices) or sorted(_scan_voices()),
     })
@@ -356,13 +410,18 @@ def models() -> JSONResponse:
     return JSONResponse({
         "object": "list",
         "data": [{
-            "id": DEFAULT_MODEL_NAME,
+            "id": _model_dir.name,
             "object": "model",
             "owned_by": "FunAudioLLM",
         }],
     })
 
 
+# OpenAI ships no voice-list endpoint at all; LocalAI documents
+# /v1/audio/voices, while ElevenLabs-style and most community
+# "OpenAI-compatible" clients guess /v1/voices. Serve one handler from both
+# paths (identical body) so their probe does not 404.
+@app.get("/v1/voices")
 @app.get("/v1/audio/voices")
 def voices() -> JSONResponse:
     current = _scan_voices()
@@ -373,7 +432,9 @@ def voices() -> JSONResponse:
         "voices": sorted(current),
         "default": default,
         "details": {
-            name: {"desc": info["desc"], "prompt_text": info["meta_prompt_text"]}
+            # display metadata only: the prompt text stays server-side (it is
+            # synthesis input, never something a caller needs)
+            name: {"desc": info["desc"]}
             for name, info in current.items()
         },
     })
@@ -396,8 +457,8 @@ def speech(req: SpeechRequest):
     _validate_prompt(voice_name, voice)
 
     stream = fmt == "pcm"
-    logger.info("tts request: %d chars, voice=%s, format=%s, speed=%s",
-                len(text), voice_name, fmt, req.speed)
+    logger.info("tts request: %d chars, voice=%s, format=%s, speed=%s, seed=%s",
+                len(text), voice_name, fmt, req.speed, req.seed)
 
     # Claim the synthesis slot before anything is sent; _pcm_stream releases it
     # when the stream ends, the buffered branch releases it in its finally.

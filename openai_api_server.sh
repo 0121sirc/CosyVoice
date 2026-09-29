@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Control the CosyVoice OpenAI-compatible TTS server (openai_tts_server.py).
 #
-# Usage: openai_api_server.sh [start|stop|status] [--host HOST] [--port PORT] [--force]
+# Usage: openai_api_server.sh [start|stop|status] [--host HOST] [--port PORT] [--model_dir DIR] [--force]
 #   start   Launch the server in the background (default when no command is given)
 #   stop    Gracefully stop it (TERM -> wait -> KILL)
 #   status  Report whether it is running and whether /v1/health responds
 #
 # Endpoints once up:
-#   GET  /v1/health  GET /v1/models  GET /v1/audio/voices
+#   GET  /v1/health  GET /v1/models  GET /v1/audio/voices  (+ alias /v1/voices)
 #   POST /v1/audio/speech   (OpenAI TTS shape, voices from ./voices/ + ./voices-ext/)
 #
 # The 6GB GPU cannot hold this server and the gradio webui at the same time, so
@@ -19,6 +19,16 @@ HERE="$(pwd)"
 
 # PATH / LD_LIBRARY_PATH (onnxruntime CUDA EP) / malloc tuning (方案A + 方案B)
 source "$HERE/.conda_env/env.sh"
+
+# Speed tuning defaults (override by exporting the vars before calling this
+# script; see .conda_env/speed_notes.md for the measurements behind each knob).
+#   COSY_FAST      comma list of monkeypatched knobs (empty string = stock speed)
+#   COSY_PREWARM   warm the ONNX speech tokenizer at boot instead of inside the
+#                  first client request (saves ~22s of first-request latency)
+#   COSY_PROFILE   per-request stage timings in the log (off by default)
+export COSY_FAST="${COSY_FAST:-hop,hopmax,cache,cudnn,nocache,nfe5,f0f32}"
+export COSY_PREWARM="${COSY_PREWARM:-1}"
+export COSY_PROFILE="${COSY_PROFILE:-}"
 
 # Default bind host: the tailscale IP, else fall back to 127.0.0.1 with a warning.
 default_host() {
@@ -37,6 +47,9 @@ default_host() {
 
 HOST="${HOST:-$(default_host)}"
 PORT="${PORT:-8091}"
+# -RL is a symlink view of Fun-CosyVoice3-0.5B whose llm.pt points at llm.rl.pt
+# (the GRPO-post-trained LLM). Fall back with --model_dir pretrained_models/Fun-CosyVoice3-0.5B.
+MODEL_DIR="${MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B-RL}"
 FORCE="${FORCE:-0}"
 PYTHON="$HERE/.conda_env/bin/python"
 # pid/log live inside the (already untracked) conda env dir so `git status` stays clean;
@@ -54,7 +67,7 @@ HEALTH_HOST="$HOST"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0") [start|stop|status] [--host HOST] [--port PORT] [--force]
+Usage: $(basename "$0") [start|stop|status] [--host HOST] [--port PORT] [--model_dir DIR] [--force]
 
   start    Start the CosyVoice OpenAI TTS server in the background (default).
            Waits until /v1/health is ready (model loading takes ~1-2 min).
@@ -62,10 +75,11 @@ Usage: $(basename "$0") [start|stop|status] [--host HOST] [--port PORT] [--force
   status   Show whether the server is running and healthy.
 
 Options:
-  --host HOST   Bind host (default: $HOST)
-  --port PORT   Bind port (default: $PORT)
-  --force       Start even if the webui appears to be running
-  -h, --help    Show this help
+  --host HOST      Bind host (default: $HOST)
+  --port PORT      Bind port (default: $PORT)
+  --model_dir DIR  Model directory (default: $MODEL_DIR)
+  --force          Start even if the webui appears to be running
+  -h, --help       Show this help
 EOF
 }
 
@@ -123,8 +137,9 @@ cmd_start() {
 
   mkdir -p "$RUN_DIR"
   : > "$LOG_FILE"
-  echo "Starting CosyVoice OpenAI TTS server on http://$HOST:$PORT ..."
+  echo "Starting CosyVoice OpenAI TTS server on http://$HOST:$PORT (model: $MODEL_DIR) ..."
   nohup "$PYTHON" "$HERE/openai_tts_server.py" --host "$HOST" --port "$PORT" \
+    --model_dir "$MODEL_DIR" \
     >>"$LOG_FILE" 2>&1 </dev/null &
   local pid=$!
   echo "$pid" > "$PID_FILE"
@@ -195,6 +210,7 @@ while [[ $# -gt 0 ]]; do
     start|stop|status) CMD="$1"; shift ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --model_dir) MODEL_DIR="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;

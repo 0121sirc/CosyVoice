@@ -36,7 +36,9 @@ default_host() {
 
 HOST="${HOST:-$(default_host)}"
 PORT="${PORT:-8000}"
-MODEL_DIR="${MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B}"
+# -RL = symlink view of Fun-CosyVoice3-0.5B whose llm.pt points at llm.rl.pt (RL
+# post-trained LLM). Revert with --model_dir pretrained_models/Fun-CosyVoice3-0.5B.
+MODEL_DIR="${MODEL_DIR:-pretrained_models/Fun-CosyVoice3-0.5B-RL}"
 FORCE="${FORCE:-0}"
 PYTHON="$HERE/.conda_env/bin/python"
 RUN_DIR="$HERE/.conda_env/.run"
